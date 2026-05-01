@@ -1,0 +1,1 @@
+This project computes the determining number of graphs using a constraint generation formulation based on integer programming.
