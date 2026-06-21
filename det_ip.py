@@ -91,7 +91,7 @@ def solve_model_2(
     G: nx.Graph,
     S: Set[int],
     *,
-    maximize_moved: bool = True,
+    maximize_moved: bool = False,
     preserve_nonedges: bool = False,
     time_limit: Optional[float] = None,
     verbose: bool = False,
@@ -102,6 +102,8 @@ def solve_model_2(
     Given an incumbent set S from Model 1, this finds a violated
     Model 1 constraint, i.e. a nontrivial automorphism fixing all vertices
     in S pointwise.
+
+    This is the version currently described in the paper.
 
     Returns:
         sigma: dict with sigma[u] = image of u, if such automorphism exists.
@@ -135,28 +137,28 @@ def solve_model_2(
             if deg[u] != deg[v]:
                 y[u, v].UB = 0
 
-    # Paper Model 2 constraint (2):
+    # Model 2 constraint (1):
     # sum_{v in V} y_{u,v} = 1 for all u in V.
     #
     # Every vertex u maps to exactly one image.
     for u in range(n):
         m.addConstr(
             gp.quicksum(y[u, v] for v in range(n)) == 1,
-            name=f"model2_constraint_2_row_{u}",
+            name=f"model2_constraint_1_row_{u}",
         )
 
-    # Paper Model 2 constraint (3):
+    # Model 2 constraint (2):
     # sum_{u in V} y_{u,v} = 1 for all v in V.
     #
     # Every vertex v has exactly one preimage.
-    # Together, constraints (2) and (3) force y to be a permutation.
+    # Together, constraints (1) and (2) force y to be a permutation.
     for v in range(n):
         m.addConstr(
             gp.quicksum(y[u, v] for u in range(n)) == 1,
-            name=f"model2_constraint_3_col_{v}",
+            name=f"model2_constraint_2_col_{v}",
         )
 
-    # Paper Model 2 constraint (4):
+    # Model 2 constraint (3):
     # y_{u1,v1} + y_{u2,v2} <= 1
     # for all (u1,u2) in E and (v1,v2) not in E.
     #
@@ -165,84 +167,85 @@ def solve_model_2(
         for v1, v2 in NE:
             m.addConstr(
                 y[u1, v1] + y[u2, v2] <= 1,
-                name=f"model2_constraint_4_edge_to_nonedge_a_{u1}_{u2}_{v1}_{v2}",
+                name=f"model2_constraint_3_edge_to_nonedge_a_{u1}_{u2}_{v1}_{v2}",
             )
 
-            # Same constraint but allowing the edge endpoint images to be swapped:
-            # u1 -> v2 and u2 -> v1.
+            # Same condition with the image endpoints swapped.
             m.addConstr(
                 y[u1, v2] + y[u2, v1] <= 1,
-                name=f"model2_constraint_4_edge_to_nonedge_b_{u1}_{u2}_{v1}_{v2}",
+                name=f"model2_constraint_3_edge_to_nonedge_b_{u1}_{u2}_{v1}_{v2}",
             )
 
-    # Paper Model 2 constraint (5):
+    # Model 2 constraint (4), optional:
     # y_{u1,v1} + y_{u2,v2} <= 1
     # for all (u1,u2) not in E and (v1,v2) in E.
     #
     # This prevents a non-edge from being mapped to an edge.
     #
-    # The paper notes that constraint (5) is optional, since it is implied
-    # by constraint (4), but we leave it as a switch.
+    # The paper notes that this constraint is optional, since a bijection
+    # preserving edges automatically preserves non-edges.
     if preserve_nonedges:
         for u1, u2 in NE:
             for v1, v2 in E:
                 m.addConstr(
                     y[u1, v1] + y[u2, v2] <= 1,
-                    name=f"model2_constraint_5_nonedge_to_edge_a_{u1}_{u2}_{v1}_{v2}",
+                    name=f"model2_constraint_4_nonedge_to_edge_a_{u1}_{u2}_{v1}_{v2}",
                 )
 
                 # Swapped endpoint version.
                 m.addConstr(
                     y[u1, v2] + y[u2, v1] <= 1,
-                    name=f"model2_constraint_5_nonedge_to_edge_b_{u1}_{u2}_{v1}_{v2}",
+                    name=f"model2_constraint_4_nonedge_to_edge_b_{u1}_{u2}_{v1}_{v2}",
                 )
 
-    # Paper Model 2 constraint (6):
+    # Model 2 constraint (5):
     # y_{v,v} = 1 for all v in S.
     #
     # The auxiliary automorphism must fix the incumbent set S pointwise.
     for v in S:
         m.addConstr(
             y[v, v] == 1,
-            name=f"model2_constraint_6_fix_S_{v}",
+            name=f"model2_constraint_5_fix_S_{v}",
         )
 
-    # Paper Model 2 constraint (7):
+    # Model 2 constraint (6):
     # sum_{u in V} (1 - y_{u,u}) >= 1.
     #
     # This forces the automorphism to be nontrivial, i.e. at least one
     # vertex must move.
     moved = m.addVars(n, vtype=GRB.BINARY, name="moved")
 
-    # Paper note after constraint (7):
     # z_u = 1 - y_{u,u}.
     #
     # We call this variable moved[u].
+    # moved[u] = 1 means vertex u is moved by the automorphism.
     for u in range(n):
         m.addConstr(
             moved[u] == 1 - y[u, u],
-            name=f"model2_constraint_7_moved_def_{u}",
+            name=f"model2_moved_def_{u}",
         )
 
-    # Paper Model 2 constraint (7), rewritten using moved variables:
+    # Nonidentity constraint:
     # sum_u moved_u >= 1.
     m.addConstr(
         gp.quicksum(moved[u] for u in range(n)) >= 1,
-        name="model2_constraint_7_nonidentity",
+        name="model2_nonidentity",
     )
 
-    # Optional objective suggested after Model 2:
-    # maximize sum_u z_u.
+    # Paper version:
+    # Model 2 is fundamentally a feasibility problem.
+    #
+    # Optional enhancement:
+    # maximize sum_u moved[u].
     #
     # This asks Model 2 to find an automorphism moving many vertices,
-    # which often gives stronger Model 1 cuts.
+    # which may produce stronger cuts for Model 1.
     if maximize_moved:
         m.setObjective(
             gp.quicksum(moved[u] for u in range(n)),
             GRB.MAXIMIZE,
         )
     else:
-        # Feasibility version of Model 2.
         m.setObjective(0, GRB.MAXIMIZE)
 
     m.optimize()
@@ -294,7 +297,7 @@ def is_automorphism(G: nx.Graph, sigma: Dict[int, int]) -> bool:
 def determining_number_ip(
     G_in: nx.Graph,
     *,
-    maximize_moved_aux: bool = True,
+    maximize_moved_aux: bool = False,
     preserve_nonedges_aux: bool = False,
     master_time_limit: Optional[float] = None,
     aux_time_limit: Optional[float] = None,
@@ -304,6 +307,15 @@ def determining_number_ip(
 ) -> DetResult:
     """
     Computes Det(G) exactly using Model 1 + Model 2 constraint generation.
+
+    This version matches the paper's current formulation:
+    - Model 1 chooses a candidate set S.
+    - Model 2 searches for a nontrivial automorphism fixing S pointwise.
+    - If one exists, add its automorphism cut to Model 1.
+    - If none exists, S is a minimum determining set.
+
+    The optional maximize_moved_aux flag adds the heuristic objective
+    max sum_u moved[u] to Model 2.
     """
     G_simple = nx.Graph(G_in)
     G_simple.remove_edges_from(nx.selfloop_edges(G_simple))
@@ -423,22 +435,73 @@ def determining_number_ip(
 
 
 def demo():
-    examples = {
-        "P6": nx.path_graph(6),
-        "C6": nx.cycle_graph(6),
-        "K6": nx.complete_graph(6),
-        "Star K1,5": nx.star_graph(5),
-        "Small asymmetric-ish graph": nx.Graph(
-            [(0, 1), (1, 2), (2, 3), (2, 4), (4, 5), (5, 6)]
-        ),
-    }
+    examples = {}
+
+    # Basic known families
+    for n in [5, 8, 10, 12]:
+        examples[f"P_{n}"] = nx.path_graph(n)
+
+    for n in [5, 8, 10, 12]:
+        examples[f"C_{n}"] = nx.cycle_graph(n)
+
+    for n in [5, 8, 10, 12]:
+        examples[f"K_{n}"] = nx.complete_graph(n)
+
+    for n in [5, 8, 10, 12]:
+        examples[f"K_{{1,{n-1}}}"] = nx.star_graph(n - 1)
+
+    # Complete bipartite graphs
+    for a, b in [(2, 3), (3, 3), (3, 4), (4, 4)]:
+        examples[f"K_{{{a},{b}}}"] = nx.complete_bipartite_graph(a, b)
+
+    # Disjoint unions
+    for k in [2, 3, 4]:
+        examples[f"{k} copies of P_3"] = nx.disjoint_union_all(
+            [nx.path_graph(3) for _ in range(k)]
+        )
+
+    for k in [2, 3, 4]:
+        examples[f"{k} copies of K_2"] = nx.disjoint_union_all(
+            [nx.complete_graph(2) for _ in range(k)]
+        )
+
+    # Grid graphs: P_m square P_n
+    for m, n in [(2, 3), (2, 4), (3, 3)]:
+        G = nx.grid_2d_graph(m, n)
+        G = nx.convert_node_labels_to_integers(G)
+        examples[f"P_{m} square P_{n}"] = G
+
+    # Hypercubes Q_d
+    for d in [2, 3]:
+        G = nx.hypercube_graph(d)
+        G = nx.convert_node_labels_to_integers(G)
+        examples[f"Q_{d}"] = G
+
+    # Wheels
+    for n in [6, 8, 10]:
+        examples[f"W_{n}"] = nx.wheel_graph(n)
+
+    # Friendship / windmill graphs
+    # windmill_graph(k, n): k copies of K_n sharing one common node
+    for k in [2, 3, 4]:
+        examples[f"Friendship F_{k}"] = nx.windmill_graph(k, 3)
+
+    # Random graphs
+    for n in [8, 10, 12]:
+        examples[f"G({n},0.5)"] = nx.erdos_renyi_graph(n, 0.5, seed=100 + n)
 
     for name, G in examples.items():
         print("\n" + "=" * 70)
         print(name)
 
-        result = determining_number_ip(G, verbose=False, progress=True)
+        result = determining_number_ip(
+            G,
+            verbose=False,
+            progress=True,
+            maximize_moved_aux=False,
+        )
 
+        print(f"n = {G.number_of_nodes()}")
         print(f"Det(G) = {result.det_number}")
         print(f"Determining set = {result.determining_set}")
         print(f"Iterations = {result.iterations}")
