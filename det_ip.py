@@ -5,6 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Hashable, List, Optional, Set, Tuple
 
+import csv
+import os
+import time
+
 import networkx as nx
 import gurobipy as gp
 
@@ -20,6 +24,7 @@ class DetResult:
     determining_set: List[Vertex]
     iterations: int
     cuts_added: int
+    runtime_sec: float
 
 
 def relabel_to_int(G: nx.Graph):
@@ -36,28 +41,25 @@ def edge_set(G: nx.Graph) -> Set[Tuple[int, int]]:
 
 def build_model_1(n: int, verbose: bool = False):
     """
-    Model 1 from Section 3.1.
+    Model 1.
 
     min sum_v x_v
-    s.t. sum_{v: sigma(v) != v} x_v >= 1
-         for every nontrivial automorphism sigma
+    s.t. sum_{v : sigma(v) != v} x_v >= 1
+         for every nontrivial automorphism sigma.
 
-    We do NOT add all automorphism constraints initially.
-    They are generated iteratively using Model 2.
+    Constraints are generated iteratively.
     """
     m = gp.Model("Model_1_DetG")
 
     if not verbose:
         m.Params.OutputFlag = 0
 
-    # Model 1 variables:
-    # x_v in {0,1} for all v in V.
-    # x_v = 1 means vertex v is placed in the determining set S.
     x = m.addVars(n, vtype=GRB.BINARY, name="x")
 
-    # Model 1 objective:
-    # min sum_{v in V} x_v
-    m.setObjective(gp.quicksum(x[v] for v in range(n)), GRB.MINIMIZE)
+    m.setObjective(
+        gp.quicksum(x[v] for v in range(n)),
+        GRB.MINIMIZE,
+    )
 
     m.update()
     return m, x
@@ -70,18 +72,15 @@ def add_model_1_cut(
     cut_index: int,
 ):
     """
-    Adds Model 1 constraint (1):
+    Add the automorphism cut
 
-        sum_{v in V : sigma(v) != v} x_v >= 1
-
-    This says the current nontrivial automorphism sigma must be broken
-    by choosing at least one vertex that sigma moves.
+        sum_{v : sigma(v) != v} x_v >= 1.
     """
     moved = [v for v in sigma if sigma[v] != v]
 
     master.addConstr(
         gp.quicksum(x[v] for v in moved) >= 1,
-        name=f"model1_constraint_1_aut_cut_{cut_index}",
+        name=f"model1_aut_cut_{cut_index}",
     )
 
     master.update()
@@ -97,17 +96,19 @@ def solve_model_2(
     verbose: bool = False,
 ) -> Optional[Dict[int, int]]:
     """
-    Model 2 from Section 3.1.
+    Model 2 from the current paper version.
 
-    Given an incumbent set S from Model 1, this finds a violated
-    Model 1 constraint, i.e. a nontrivial automorphism fixing all vertices
-    in S pointwise.
+    Given an incumbent set S from Model 1, this searches for a nontrivial
+    automorphism fixing every vertex in S pointwise.
 
-    This is the version currently described in the paper.
+    If such an automorphism exists, it gives a violated Model 1 constraint.
+    If none exists, S is a determining set.
 
-    Returns:
-        sigma: dict with sigma[u] = image of u, if such automorphism exists.
-        None: if no nontrivial automorphism fixes S.
+    Parameters
+    ----------
+    maximize_moved:
+        If True, use the optional objective max sum moved[u].
+        If False, solve Model 2 as a feasibility problem.
     """
     n = G.number_of_nodes()
     E = edge_set(G)
@@ -123,123 +124,81 @@ def solve_model_2(
     if time_limit is not None:
         m.Params.TimeLimit = time_limit
 
-    # Model 2 variables:
-    # y_{u,v} in {0,1} for all u,v in V.
-    # y_{u,v} = 1 means the automorphism maps u -> v.
+    # y[u,v] = 1 means sigma(u) = v.
     y = m.addVars(n, n, vtype=GRB.BINARY, name="y")
 
     # Optional degree pruning.
-    # This is not one of the paper constraints, but is valid because
-    # automorphisms preserve vertex degree.
+    # Automorphisms preserve degree.
     deg = dict(G.degree())
     for u in range(n):
         for v in range(n):
             if deg[u] != deg[v]:
                 y[u, v].UB = 0
 
-    # Model 2 constraint (1):
-    # sum_{v in V} y_{u,v} = 1 for all u in V.
-    #
-    # Every vertex u maps to exactly one image.
+    # Each vertex maps to exactly one image.
     for u in range(n):
         m.addConstr(
             gp.quicksum(y[u, v] for v in range(n)) == 1,
-            name=f"model2_constraint_1_row_{u}",
+            name=f"row_{u}",
         )
 
-    # Model 2 constraint (2):
-    # sum_{u in V} y_{u,v} = 1 for all v in V.
-    #
-    # Every vertex v has exactly one preimage.
-    # Together, constraints (1) and (2) force y to be a permutation.
+    # Each vertex has exactly one preimage.
     for v in range(n):
         m.addConstr(
             gp.quicksum(y[u, v] for u in range(n)) == 1,
-            name=f"model2_constraint_2_col_{v}",
+            name=f"col_{v}",
         )
 
-    # Model 2 constraint (3):
-    # y_{u1,v1} + y_{u2,v2} <= 1
-    # for all (u1,u2) in E and (v1,v2) not in E.
-    #
-    # This prevents an edge from being mapped to a non-edge.
+    # Edges cannot map to nonedges.
     for u1, u2 in E:
         for v1, v2 in NE:
             m.addConstr(
                 y[u1, v1] + y[u2, v2] <= 1,
-                name=f"model2_constraint_3_edge_to_nonedge_a_{u1}_{u2}_{v1}_{v2}",
+                name=f"edge_to_nonedge_a_{u1}_{u2}_{v1}_{v2}",
             )
-
-            # Same condition with the image endpoints swapped.
             m.addConstr(
                 y[u1, v2] + y[u2, v1] <= 1,
-                name=f"model2_constraint_3_edge_to_nonedge_b_{u1}_{u2}_{v1}_{v2}",
+                name=f"edge_to_nonedge_b_{u1}_{u2}_{v1}_{v2}",
             )
 
-    # Model 2 constraint (4), optional:
-    # y_{u1,v1} + y_{u2,v2} <= 1
-    # for all (u1,u2) not in E and (v1,v2) in E.
-    #
-    # This prevents a non-edge from being mapped to an edge.
-    #
-    # The paper notes that this constraint is optional, since a bijection
-    # preserving edges automatically preserves non-edges.
+    # Optional: nonedges cannot map to edges.
+    # The paper notes this is optional.
     if preserve_nonedges:
         for u1, u2 in NE:
             for v1, v2 in E:
                 m.addConstr(
                     y[u1, v1] + y[u2, v2] <= 1,
-                    name=f"model2_constraint_4_nonedge_to_edge_a_{u1}_{u2}_{v1}_{v2}",
+                    name=f"nonedge_to_edge_a_{u1}_{u2}_{v1}_{v2}",
                 )
-
-                # Swapped endpoint version.
                 m.addConstr(
                     y[u1, v2] + y[u2, v1] <= 1,
-                    name=f"model2_constraint_4_nonedge_to_edge_b_{u1}_{u2}_{v1}_{v2}",
+                    name=f"nonedge_to_edge_b_{u1}_{u2}_{v1}_{v2}",
                 )
 
-    # Model 2 constraint (5):
-    # y_{v,v} = 1 for all v in S.
-    #
-    # The auxiliary automorphism must fix the incumbent set S pointwise.
+    # Fix every vertex in S pointwise.
     for v in S:
         m.addConstr(
             y[v, v] == 1,
-            name=f"model2_constraint_5_fix_S_{v}",
+            name=f"fix_S_{v}",
         )
 
-    # Model 2 constraint (6):
-    # sum_{u in V} (1 - y_{u,u}) >= 1.
-    #
-    # This forces the automorphism to be nontrivial, i.e. at least one
-    # vertex must move.
+    # moved[u] = 1 - y[u,u].
     moved = m.addVars(n, vtype=GRB.BINARY, name="moved")
 
-    # z_u = 1 - y_{u,u}.
-    #
-    # We call this variable moved[u].
-    # moved[u] = 1 means vertex u is moved by the automorphism.
     for u in range(n):
         m.addConstr(
             moved[u] == 1 - y[u, u],
-            name=f"model2_moved_def_{u}",
+            name=f"moved_def_{u}",
         )
 
-    # Nonidentity constraint:
-    # sum_u moved_u >= 1.
+    # Nonidentity constraint.
     m.addConstr(
         gp.quicksum(moved[u] for u in range(n)) >= 1,
-        name="model2_nonidentity",
+        name="nonidentity",
     )
 
-    # Paper version:
-    # Model 2 is fundamentally a feasibility problem.
-    #
-    # Optional enhancement:
-    # maximize sum_u moved[u].
-    #
-    # This asks Model 2 to find an automorphism moving many vertices,
-    # which may produce stronger cuts for Model 1.
+    # Feasibility version by default.
+    # Optional heuristic objective: maximize number of moved vertices.
     if maximize_moved:
         m.setObjective(
             gp.quicksum(moved[u] for u in range(n)),
@@ -286,6 +245,7 @@ def is_automorphism(G: nx.Graph, sigma: Dict[int, int]) -> bool:
         return False
 
     E = edge_set(G)
+
     mapped_E = {
         tuple(sorted((sigma[u], sigma[v])))
         for u, v in E
@@ -308,15 +268,14 @@ def determining_number_ip(
     """
     Computes Det(G) exactly using Model 1 + Model 2 constraint generation.
 
-    This version matches the paper's current formulation:
-    - Model 1 chooses a candidate set S.
-    - Model 2 searches for a nontrivial automorphism fixing S pointwise.
-    - If one exists, add its automorphism cut to Model 1.
+    Current paper version:
+    - Model 1 solves for an incumbent set S.
+    - Model 2 searches for a nontrivial automorphism fixing S.
+    - If one exists, add the corresponding automorphism cut.
     - If none exists, S is a minimum determining set.
-
-    The optional maximize_moved_aux flag adds the heuristic objective
-    max sum_u moved[u] to Model 2.
     """
+    start_time = time.perf_counter()
+
     G_simple = nx.Graph(G_in)
     G_simple.remove_edges_from(nx.selfloop_edges(G_simple))
 
@@ -329,6 +288,7 @@ def determining_number_ip(
             determining_set=[],
             iterations=0,
             cuts_added=0,
+            runtime_sec=time.perf_counter() - start_time,
         )
 
     master, x = build_model_1(n, verbose=False)
@@ -396,6 +356,7 @@ def determining_number_ip(
                     determining_set=determining_set,
                     iterations=iteration,
                     cuts_added=cuts_added,
+                    runtime_sec=time.perf_counter() - start_time,
                 )
 
             moved_count = sum(1 for v in sigma if sigma[v] != v)
@@ -424,7 +385,7 @@ def determining_number_ip(
                 ]
                 print(
                     f"  Model 2 found nontrivial automorphism fixing S; "
-                    f"adding Model 1 constraint (1) over moved vertices {moved_original}"
+                    f"adding Model 1 cut over moved vertices {moved_original}"
                 )
 
     finally:
@@ -490,6 +451,8 @@ def demo():
     for n in [8, 10, 12]:
         examples[f"G({n},0.5)"] = nx.erdos_renyi_graph(n, 0.5, seed=100 + n)
 
+    rows = []
+
     for name, G in examples.items():
         print("\n" + "=" * 70)
         print(name)
@@ -499,13 +462,50 @@ def demo():
             verbose=False,
             progress=True,
             maximize_moved_aux=False,
+            preserve_nonedges_aux=False,
         )
 
-        print(f"n = {G.number_of_nodes()}")
+        n_vertices = G.number_of_nodes()
+
+        print(f"n = {n_vertices}")
         print(f"Det(G) = {result.det_number}")
         print(f"Determining set = {result.determining_set}")
         print(f"Iterations = {result.iterations}")
         print(f"Cuts added = {result.cuts_added}")
+        print(f"Runtime = {result.runtime_sec:.4f} sec")
+
+        rows.append({
+            "graph": name,
+            "n": n_vertices,
+            "det": result.det_number,
+            "determining_set": result.determining_set,
+            "iterations": result.iterations,
+            "cuts_added": result.cuts_added,
+            "runtime_sec": round(result.runtime_sec, 6),
+        })
+
+    output_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "det_results.csv",
+    )
+
+    with open(output_path, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "graph",
+                "n",
+                "det",
+                "determining_set",
+                "iterations",
+                "cuts_added",
+                "runtime_sec",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"\nSaved results to {output_path}")
 
 
 if __name__ == "__main__":
