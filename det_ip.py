@@ -11,6 +11,8 @@ import time
 
 import networkx as nx
 import gurobipy as gp
+import platform
+import sys
 
 from gurobipy import GRB
 from tqdm.auto import tqdm
@@ -396,6 +398,11 @@ def determining_number_ip(
 
 
 def demo():
+    print("Python:", sys.version)
+    print("Gurobi:", gp.gurobi.version())
+    print("NetworkX:", nx.__version__)
+    print("Operating system:", platform.platform())
+    print("Processor:", platform.processor())
     examples = {}
 
     # Basic known families
@@ -460,7 +467,7 @@ def demo():
         result = determining_number_ip(
             G,
             verbose=False,
-            progress=True,
+            progress=False,
             maximize_moved_aux=False,
             preserve_nonedges_aux=False,
         )
